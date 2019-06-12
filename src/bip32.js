@@ -106,7 +106,7 @@ class BIP32 {
         return wif.encode(this.network.wif, this.privateKey, true);
     }
     // https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#child-key-derivation-ckd-functions
-    derive(index) {
+    derive(index, curve = 'secp256k1') {
         typeforce(typeforce.UInt32, index);
         const isHardened = index >= HIGHEST_BIT;
         const data = Buffer.allocUnsafe(37);
@@ -121,6 +121,9 @@ class BIP32 {
             // Normal child
         }
         else {
+            if (curve === 'ed25519') {
+                throw new Error('normal derivation is not supported for ed25519 (see slip-0010)');
+            }
             // data = serP(point(kpar)) || ser32(index)
             //      = serP(Kpar) || ser32(index)
             this.publicKey.copy(data, 0);
@@ -130,20 +133,31 @@ class BIP32 {
         const IL = I.slice(0, 32);
         const IR = I.slice(32);
         // if parse256(IL) >= n, proceed with the next value for i
-        if (!ecc.isPrivate(IL))
+        if (curve !== 'ed25519' && !ecc.isPrivate(IL))
             return this.derive(index + 1);
         // Private parent key -> private child key
         let hd;
         if (!this.isNeutered()) {
-            // ki = parse256(IL) + kpar (mod n)
-            const ki = ecc.privateAdd(this.privateKey, IL);
-            // In case ki == 0, proceed with the next value for i
-            if (ki == null)
-                return this.derive(index + 1);
-            hd = fromPrivateKeyLocal(ki, IR, this.network, this.depth + 1, index, this.fingerprint.readUInt32BE(0));
+            // ed25519 is special (slip-0010)
+            if (curve === 'ed25519') {
+                // ki = parse256(IL)
+                const ki = IL;
+                hd = fromPrivateKeyLocal(ki, IR, this.network, this.depth + 1, index, this.fingerprint.readUInt32BE(0));
+            }
+            else {
+                // ki = parse256(IL) + kpar (mod n)
+                const ki = ecc.privateAdd(this.privateKey, IL);
+                // In case ki == 0, proceed with the next value for i
+                if (ki == null)
+                    return this.derive(index + 1);
+                hd = fromPrivateKeyLocal(ki, IR, this.network, this.depth + 1, index, this.fingerprint.readUInt32BE(0));
+            }
             // Public parent key -> public child key
         }
         else {
+            if (curve === 'ed25519') {
+                throw new Error('normal derivation is not supported for ed25519 (see slip-0010)');
+            }
             // Ki = point(parse256(IL)) + Kpar
             //    = G*IL + Kpar
             const Ki = ecc.pointAddScalar(this.publicKey, IL, true);
@@ -154,12 +168,12 @@ class BIP32 {
         }
         return hd;
     }
-    deriveHardened(index) {
+    deriveHardened(index, curve = 'secp256k1') {
         typeforce(UInt31, index);
         // Only derives hardened private keys by default
-        return this.derive(index + HIGHEST_BIT);
+        return this.derive(index + HIGHEST_BIT, curve);
     }
-    derivePath(path) {
+    derivePath(path, curve = 'secp256k1') {
         typeforce(BIP32Path, path);
         let splitPath = path.split('/');
         if (splitPath[0] === 'm') {
@@ -171,11 +185,11 @@ class BIP32 {
             let index;
             if (indexStr.slice(-1) === `'`) {
                 index = parseInt(indexStr.slice(0, -1), 10);
-                return prevHd.deriveHardened(index);
+                return prevHd.deriveHardened(index, curve);
             }
             else {
                 index = parseInt(indexStr, 10);
-                return prevHd.derive(index);
+                return prevHd.derive(index, curve);
             }
         }, this);
     }
@@ -272,14 +286,16 @@ function fromPublicKeyLocal(publicKey, chainCode, network, depth, index, parentF
         throw new TypeError('Point is not on the curve');
     return new BIP32(undefined, publicKey, chainCode, network, depth, index, parentFingerprint);
 }
-function fromSeed(seed, network) {
+function fromSeed(seed, network, curve = 'secp256k1') {
     typeforce(typeforce.Buffer, seed);
     if (seed.length < 16)
         throw new TypeError('Seed should be at least 128 bits');
     if (seed.length > 64)
         throw new TypeError('Seed should be at most 512 bits');
     network = network || BITCOIN;
-    const I = crypto.hmacSHA512(Buffer.from('Bitcoin seed', 'utf8'), seed);
+    // See: https://github.com/satoshilabs/slips/blob/master/slip-0010.md
+    const masterSecret = curve === 'secp256k1' ? 'Bitcoin seed' : curve === 'P-256' ? 'Nist256p1 seed' : curve === 'ed25519' ? 'ed25519 seed' : '';
+    const I = crypto.hmacSHA512(Buffer.from(masterSecret, 'utf8'), seed);
     const IL = I.slice(0, 32);
     const IR = I.slice(32);
     return fromPrivateKey(IL, IR, network);
